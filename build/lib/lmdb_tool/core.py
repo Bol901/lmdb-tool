@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pickle
+import time
 from uuid import uuid4
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -314,8 +315,14 @@ def ingest_json_incremental(
             return
         remaining = max(0, total - done)
         pct = 100.0 * done / max(1, total)
+        elapsed_s = max(0.0, time.time() - start_ts)
+        if done > 0:
+            sec_per_item = elapsed_s / done
+            eta_s = remaining * sec_per_item
+        else:
+            eta_s = float("nan")
         LOG.info(
-            "LMDB ingest progress: processed=%d/%d (%.2f%%) newly_ingested=%d failed=%d already_present(skip)=%d remaining=%d",
+            "LMDB ingest progress: processed=%d/%d (%.2f%%) newly_ingested=%d failed=%d already_present(skip)=%d remaining=%d elapsed=%.1fs eta=%.1fs",
             done,
             total,
             pct,
@@ -323,12 +330,15 @@ def ingest_json_incremental(
             stats.failed,
             stats.already_present,
             remaining,
+            elapsed_s,
+            eta_s,
         )
 
     done = 0
     total = len(candidates)
     error_logged = 0
     success_paths: List[str] = []
+    start_ts = time.time()
 
     run_id = str(uuid4())
     writer = _BatchSyncWriter(

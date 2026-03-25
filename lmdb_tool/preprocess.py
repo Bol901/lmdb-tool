@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pickle
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -70,18 +70,6 @@ def _percentile_clip_normalize_f16(t: torch.Tensor) -> Tuple[torch.Tensor, Dict[
     return y.half(), {"p_low": float(pl), "p_high": float(ph)}
 
 
-def _foreground_bbox_zyx(t: torch.Tensor, thr: float = 1e-3) -> List[int]:
-    if t.ndim != 4 or t.shape[0] != 1:
-        raise ValueError(f"expected (1,D,H,W), got {tuple(t.shape)}")
-    m = (t[0] > thr).nonzero(as_tuple=False)
-    if m.numel() == 0:
-        d, h, w = t.shape[1:]
-        return [0, d - 1, 0, h - 1, 0, w - 1]
-    mn = m.min(dim=0).values.cpu().tolist()
-    mx = m.max(dim=0).values.cpu().tolist()
-    return [mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]]
-
-
 def _affine_from_meta(t: Any) -> np.ndarray:
     if hasattr(t, "meta") and t.meta is not None and "affine" in t.meta:
         aff = t.meta["affine"]
@@ -109,7 +97,6 @@ def process_nifti_to_payloads(nifti_path: str) -> Tuple[bytes, bytes, bytes]:
 
     native_t = vol_ras.detach().clone()
     native_f16, st_nat = _percentile_clip_normalize_f16(native_t)
-    bbox_nat = _foreground_bbox_zyx(native_f16)
 
     spacing_iso = Compose(
         [
@@ -120,7 +107,6 @@ def process_nifti_to_payloads(nifti_path: str) -> Tuple[bytes, bytes, bytes]:
     vol_iso = d_iso["image"]
     aff_iso = _affine_from_meta(vol_iso)
     iso_f16, st_iso = _percentile_clip_normalize_f16(vol_iso)
-    bbox_iso = _foreground_bbox_zyx(iso_f16)
 
     iso_np = iso_f16.detach().cpu().numpy()
     nat_np = native_f16.detach().cpu().numpy()
@@ -132,8 +118,6 @@ def process_nifti_to_payloads(nifti_path: str) -> Tuple[bytes, bytes, bytes]:
         "affine_native": aff_native,
         "shape_iso": tuple(int(x) for x in iso_np.shape),
         "shape_native": tuple(int(x) for x in nat_np.shape),
-        "bbox_iso": bbox_iso,
-        "bbox_native": bbox_nat,
         "stats": {"iso": st_iso, "native": st_nat},
         "source_path": os.path.abspath(nifti_path),
     }
