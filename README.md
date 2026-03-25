@@ -5,7 +5,7 @@ Incremental sharded LMDB maintainer for MRI NIfTI datasets.
 ## Install
 
 ```bash
-pip install "git+https://github.com/<your-user>/lmdb-tool.git"
+pip install "git+https://github.com/Bol901/lmdb-tool.git"
 ```
 
 ## CLI

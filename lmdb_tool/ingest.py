@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-shard-size-gb", type=float, default=500.0)
     p.add_argument("--map-size", type=int, default=DEFAULT_MAP_SIZE)
     p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--sync-every", type=int, default=64, help="每 N 条成功写入后 env.sync + 保存 manifest；崩溃时可查 ingest_unsynced_paths.json")
     p.add_argument("--log-every", type=int, default=1000)
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
@@ -33,6 +34,7 @@ def main() -> None:
         max_shard_size_bytes=max_bytes,
         map_size=args.map_size,
         workers=args.workers,
+        sync_every=args.sync_every,
         log_every=args.log_every,
         dry_run=args.dry_run,
     )

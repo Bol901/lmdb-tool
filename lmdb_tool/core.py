@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pickle
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lmdb
 import numpy as np
@@ -22,6 +23,7 @@ from .index import (
 from .types import (
     DEFAULT_MAP_SIZE,
     DEFAULT_MAX_SHARD_SIZE_BYTES,
+    INGEST_UNSYNCED_PATHS_JSON,
     KEY_KEYS,
     SHARD_PREFIX,
     SHARD_SUFFIX,
@@ -82,6 +84,91 @@ def _process_worker(nifti_abs: str) -> Tuple[str, Optional[Tuple[bytes, bytes, b
         return nifti_abs, None, str(e)
 
 
+def _write_unsynced_paths_json(lmdb_folder: str, paths: List[str]) -> None:
+    path = os.path.join(lmdb_folder, INGEST_UNSYNCED_PATHS_JSON)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"paths": paths}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+class _BatchSyncWriter:
+    """复用各 shard 的 LMDB Environment；每 sync_every 次成功写入后 sync + save_manifest，并清空未落盘 path 记录。"""
+
+    def __init__(
+        self,
+        lmdb_folder: str,
+        manifest: Dict[str, Any],
+        *,
+        map_size: int,
+        max_shard_size_bytes: int,
+        sync_every: int,
+    ) -> None:
+        self.lmdb_folder = lmdb_folder
+        self.manifest = manifest
+        self.map_size = map_size
+        self.max_shard_size_bytes = max_shard_size_bytes
+        self.sync_every = max(1, int(sync_every))
+        self._envs: Dict[str, lmdb.Environment] = {}
+        self._unsynced_paths: List[str] = []
+        self._writes_since_sync = 0
+
+    def _get_env(self, shard_name: str) -> lmdb.Environment:
+        if shard_name not in self._envs:
+            shard_dir = os.path.join(self.lmdb_folder, shard_name)
+            self._envs[shard_name] = _open_env(shard_dir, map_size=self.map_size, readonly=False)
+        return self._envs[shard_name]
+
+    def commit_payload(
+        self,
+        base: str,
+        p: str,
+        sid: str,
+        iso_b: bytes,
+        nat_b: bytes,
+        meta_b: bytes,
+    ) -> None:
+        add = len(iso_b) + len(nat_b) + len(meta_b)
+        shard_name = _select_writable_shard(self.manifest, self.max_shard_size_bytes, add)
+        env = self._get_env(shard_name)
+        k_iso, k_nat, k_meta = _subject_keys(sid)
+        with env.begin(write=True) as txn:
+            txn.put(k_iso, iso_b)
+            txn.put(k_nat, nat_b)
+            txn.put(k_meta, meta_b)
+            current = txn.get(KEY_KEYS)
+            ids = [] if current is None else pickle.loads(current)
+            if sid not in ids:
+                ids.append(sid)
+            txn.put(KEY_KEYS, pickle.dumps(ids, protocol=pickle.HIGHEST_PROTOCOL))
+        set_basename_entry(self.manifest, base, shard=shard_name, sid=sid, source_path=p)
+        bump_shard_stats(self.manifest, shard_name, add)
+        self._unsynced_paths.append(p)
+        _write_unsynced_paths_json(self.lmdb_folder, self._unsynced_paths)
+        self._writes_since_sync += 1
+        if self._writes_since_sync >= self.sync_every:
+            self._flush_sync()
+
+    def _flush_sync(self) -> None:
+        for env in self._envs.values():
+            env.sync()
+        save_manifest(self.lmdb_folder, self.manifest)
+        self._unsynced_paths.clear()
+        _write_unsynced_paths_json(self.lmdb_folder, [])
+        self._writes_since_sync = 0
+
+    def finalize(self) -> None:
+        for env in self._envs.values():
+            env.sync()
+        save_manifest(self.lmdb_folder, self.manifest)
+        self._unsynced_paths.clear()
+        _write_unsynced_paths_json(self.lmdb_folder, [])
+        self._writes_since_sync = 0
+        for env in self._envs.values():
+            env.close()
+        self._envs.clear()
+
+
 def ingest_json_incremental(
     json_path: str,
     root_dir: str,
@@ -92,15 +179,15 @@ def ingest_json_incremental(
     workers: int = 0,
     log_every: int = 1000,
     dry_run: bool = False,
+    sync_every: int = 64,
 ) -> Dict[str, Any]:
-    import json
-
     root_dir = os.path.abspath(os.path.expanduser(root_dir))
     lmdb_folder = os.path.abspath(os.path.expanduser(lmdb_folder))
     manifest = load_manifest(lmdb_folder)
 
     with open(json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+    print(f"Number of items in JSON: {len(raw)}")
 
     stats = IngestStats(total_inputs=len(raw))
     log_every = max(1, int(log_every))
@@ -138,86 +225,57 @@ def ingest_json_incremental(
     done = 0
     total = len(candidates)
 
-    if workers <= 1:
-        for base, p, sid in candidates:
-            try:
-                iso_b, nat_b, meta_b = process_nifti_to_payloads(p)
-            except Exception:
-                stats.failed += 1
-                done += 1
-                _log(done, total)
-                continue
-            add = len(iso_b) + len(nat_b) + len(meta_b)
-            shard_name = _select_writable_shard(manifest, max_shard_size_bytes, add)
-            shard_dir = os.path.join(lmdb_folder, shard_name)
-            env = _open_env(shard_dir, map_size=map_size, readonly=False)
-            try:
-                k_iso, k_nat, k_meta = _subject_keys(sid)
-                with env.begin(write=True) as txn:
-                    txn.put(k_iso, iso_b)
-                    txn.put(k_nat, nat_b)
-                    txn.put(k_meta, meta_b)
-                    # append sid in per-shard __keys__
-                    current = txn.get(KEY_KEYS)
-                    ids = [] if current is None else pickle.loads(current)
-                    if sid not in ids:
-                        ids.append(sid)
-                    txn.put(KEY_KEYS, pickle.dumps(ids, protocol=pickle.HIGHEST_PROTOCOL))
-                set_basename_entry(manifest, base, shard=shard_name, sid=sid, source_path=p)
-                bump_shard_stats(manifest, shard_name, add)
-                stats.newly_ingested += 1
-            except Exception:
-                stats.failed += 1
-            finally:
-                env.sync()
-                env.close()
-            done += 1
-            _log(done, total)
-    else:
-        import multiprocessing as mp
-
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-            futs = {ex.submit(_process_worker, p): (base, p, sid) for base, p, sid in candidates}
-            for fut in as_completed(futs):
-                base, p, sid = futs[fut]
+    writer = _BatchSyncWriter(
+        lmdb_folder,
+        manifest,
+        map_size=map_size,
+        max_shard_size_bytes=max_shard_size_bytes,
+        sync_every=sync_every,
+    )
+    try:
+        if workers <= 1:
+            for base, p, sid in candidates:
                 try:
-                    _, payload, err = fut.result()
+                    iso_b, nat_b, meta_b = process_nifti_to_payloads(p)
                 except Exception:
-                    payload, err = None, "future failed"
-                if err or payload is None:
                     stats.failed += 1
                     done += 1
                     _log(done, total)
                     continue
-                iso_b, nat_b, meta_b = payload
-                add = len(iso_b) + len(nat_b) + len(meta_b)
-                shard_name = _select_writable_shard(manifest, max_shard_size_bytes, add)
-                shard_dir = os.path.join(lmdb_folder, shard_name)
-                env = _open_env(shard_dir, map_size=map_size, readonly=False)
                 try:
-                    k_iso, k_nat, k_meta = _subject_keys(sid)
-                    with env.begin(write=True) as txn:
-                        txn.put(k_iso, iso_b)
-                        txn.put(k_nat, nat_b)
-                        txn.put(k_meta, meta_b)
-                        current = txn.get(KEY_KEYS)
-                        ids = [] if current is None else pickle.loads(current)
-                        if sid not in ids:
-                            ids.append(sid)
-                        txn.put(KEY_KEYS, pickle.dumps(ids, protocol=pickle.HIGHEST_PROTOCOL))
-                    set_basename_entry(manifest, base, shard=shard_name, sid=sid, source_path=p)
-                    bump_shard_stats(manifest, shard_name, add)
+                    writer.commit_payload(base, p, sid, iso_b, nat_b, meta_b)
                     stats.newly_ingested += 1
                 except Exception:
                     stats.failed += 1
-                finally:
-                    env.sync()
-                    env.close()
                 done += 1
                 _log(done, total)
+        else:
+            import multiprocessing as mp
 
-    save_manifest(lmdb_folder, manifest)
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+                futs = {ex.submit(_process_worker, p): (base, p, sid) for base, p, sid in candidates}
+                for fut in as_completed(futs):
+                    base, p, sid = futs[fut]
+                    try:
+                        _, payload, err = fut.result()
+                    except Exception:
+                        payload, err = None, "future failed"
+                    if err or payload is None:
+                        stats.failed += 1
+                        done += 1
+                        _log(done, total)
+                        continue
+                    iso_b, nat_b, meta_b = payload
+                    try:
+                        writer.commit_payload(base, p, sid, iso_b, nat_b, meta_b)
+                        stats.newly_ingested += 1
+                    except Exception:
+                        stats.failed += 1
+                    done += 1
+                    _log(done, total)
+    finally:
+        writer.finalize()
     out = stats.as_dict()
     out["lmdb_folder"] = lmdb_folder
     out["n_shards"] = len(manifest.get("shards", {}))

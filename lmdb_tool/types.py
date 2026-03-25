@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 MANIFEST_NAME = "manifest.json"
+INGEST_UNSYNCED_PATHS_JSON = "ingest_unsynced_paths.json"
 SHARD_PREFIX = "shard_"
 SHARD_SUFFIX = ".lmdb"
 DEFAULT_MAX_SHARD_SIZE_BYTES = 500 * 1024 * 1024 * 1024
