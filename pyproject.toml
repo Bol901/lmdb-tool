@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmdb_tool"
-version = "0.1.0"
+version = "0.1.1"
 description = "Incremental sharded LMDB maintainer for MRI NIfTI datasets."
 readme = "README.md"
 requires-python = ">=3.9"
