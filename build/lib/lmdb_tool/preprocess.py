@@ -5,12 +5,17 @@ import os
 import pickle
 from typing import Any, Dict, Optional, Tuple
 
+import h5py
 import numpy as np
 import torch
 from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, LoadImaged, Orientationd, Spacingd
 
 # 预处理阶段优先稳定性：分位数一律走 numpy（必要时抽样），避免 torch.quantile 的尺寸限制与潜在不一致。
 MAX_PERCENTILE_NUMPY = 2_000_000
+
+INT16_MIN = -32768.0
+INT16_MAX = 32767.0
+INT16_RANGE = INT16_MAX - INT16_MIN  # 65535.0
 
 
 def resolve_nifti_path(item: Any, data_root: Optional[str]) -> str:
@@ -77,6 +82,62 @@ def _affine_from_meta(t: Any) -> np.ndarray:
             return aff.detach().cpu().numpy().astype(np.float64)
         return np.asarray(aff, dtype=np.float64)
     return np.eye(4, dtype=np.float64)
+
+
+def process_h5_to_payloads(
+    h5_path: str,
+    *,
+    source_nifti_path: Optional[str] = None,
+) -> Tuple[bytes, bytes, bytes]:
+    """Read precomputed H5 and convert back to float16 normalized tensors (0-1).
+
+    Your legacy `nifti_to_h5.py` stores:
+      - image/native and image/iso1mm as int16 clipped then mapped to full int16 range
+    So this function only needs the inverse mapping from int16 range to [0, 1].
+    """
+    if not os.path.isfile(h5_path):
+        raise FileNotFoundError(h5_path)
+
+    h5_abs = os.path.abspath(h5_path)
+    src = os.path.abspath(source_nifti_path) if source_nifti_path else h5_abs
+
+    with h5py.File(h5_abs, "r") as f:
+        nat_i16 = f["image/native"][:]  # (D,H,W), int16
+        iso_i16 = f["image/iso1mm"][:]  # (D,H,W), int16
+
+        aff_native = f["meta/native/affine"][:]  # (4,4), float32
+        aff_iso = f["meta/iso1mm/affine"][:]  # (4,4), float32
+
+        nat_clip_p = f["meta/native/intensity/clip_p"][:]  # (2,)
+        iso_clip_p = f["meta/iso1mm/intensity/clip_p"][:]  # (2,)
+
+    # int16 full-range -> [0,1] normalized float
+    nat_f = (nat_i16.astype(np.float32) - INT16_MIN) / INT16_RANGE
+    iso_f = (iso_i16.astype(np.float32) - INT16_MIN) / INT16_RANGE
+    nat_f = np.clip(nat_f, 0.0, 1.0)
+    iso_f = np.clip(iso_f, 0.0, 1.0)
+
+    # Match nifti path preprocessing output shape: (1,D,H,W) and dtype float16
+    nat_np = nat_f.astype(np.float16)[None, ...]
+    iso_np = iso_f.astype(np.float16)[None, ...]
+
+    meta = {
+        "affine_iso": aff_iso.astype(np.float64),
+        "affine_native": aff_native.astype(np.float64),
+        "shape_iso": tuple(int(x) for x in iso_np.shape),
+        "shape_native": tuple(int(x) for x in nat_np.shape),
+        "stats": {
+            "iso": {"p_low": float(iso_clip_p[0]), "p_high": float(iso_clip_p[1])},
+            "native": {"p_low": float(nat_clip_p[0]), "p_high": float(nat_clip_p[1])},
+        },
+        "source_path": src,
+    }
+
+    return (
+        iso_np.tobytes(),
+        nat_np.tobytes(),
+        pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL),
+    )
 
 
 def process_nifti_to_payloads(nifti_path: str) -> Tuple[bytes, bytes, bytes]:

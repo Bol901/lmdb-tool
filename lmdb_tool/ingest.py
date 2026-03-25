@@ -23,6 +23,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=1000)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
+        "--h5-root-folder",
+        type=str,
+        default=None,
+        help="如果提供，且输入 nifti 路径存在对应 h5（按 root_dir 映射规则），则从 h5 读取并仅补全 0-1 归一化。",
+    )
+    p.add_argument(
         "--max-error-logs",
         type=int,
         default=20,
@@ -56,6 +62,7 @@ def main() -> None:
         log_every=args.log_every,
         dry_run=args.dry_run,
         max_ingest=args.max_ingest,
+        h5_root_folder=args.h5_root_folder,
         max_error_logs=args.max_error_logs,
     )
     print(stats)

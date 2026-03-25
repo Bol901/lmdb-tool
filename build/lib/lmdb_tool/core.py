@@ -13,7 +13,12 @@ import lmdb
 import numpy as np
 import torch
 
-from .preprocess import resolve_nifti_path, process_nifti_to_payloads, subject_id_from_path
+from .preprocess import (
+    process_h5_to_payloads,
+    process_nifti_to_payloads,
+    resolve_nifti_path,
+    subject_id_from_path,
+)
 from .index import (
     basename_entry,
     bump_shard_stats,
@@ -79,8 +84,33 @@ def _open_env(path: str, map_size: int, readonly: bool = False) -> lmdb.Environm
         return lmdb.open(path, writemap=False, **kw)
 
 
-def _process_worker(nifti_abs: str) -> Tuple[str, Optional[Tuple[bytes, bytes, bytes]], Optional[str]]:
+def _nifti_abs_to_h5_path(nifti_abs: str, nifti_root: str, h5_root: str) -> Optional[str]:
+    nifti_abs = os.path.abspath(nifti_abs)
+    nifti_root = os.path.abspath(nifti_root)
+    h5_root = os.path.abspath(h5_root)
+
+    if not nifti_abs.startswith(nifti_root):
+        return None
+    rel = nifti_abs[len(nifti_root) :].lstrip("/")
+    for ext in (".nii.gz", ".nii"):
+        if rel.endswith(ext):
+            rel = rel[: -len(ext)] + ".h5"
+            break
+    return os.path.join(h5_root, rel)
+
+
+def _process_worker(
+    nifti_abs: str,
+    h5_path: Optional[str],
+    *,
+    h5_nifti_root: Optional[str] = None,
+    h5_root_folder: Optional[str] = None,
+) -> Tuple[str, Optional[Tuple[bytes, bytes, bytes]], Optional[str]]:
+    """Worker: prefer reading from H5 when available; fallback to NIfTI."""
     try:
+        use_h5 = h5_path is not None and os.path.isfile(h5_path)
+        if use_h5:
+            return nifti_abs, process_h5_to_payloads(h5_path, source_nifti_path=nifti_abs), None
         return nifti_abs, process_nifti_to_payloads(nifti_abs), None
     except Exception as e:
         return nifti_abs, None, str(e)
@@ -245,11 +275,15 @@ def ingest_json_incremental(
     log_every: int = 1000,
     dry_run: bool = False,
     sync_every: int = 64,
+    h5_root_folder: Optional[str] = None,
     max_ingest: Optional[int] = None,
     max_error_logs: int = 20,
 ) -> Dict[str, Any]:
     root_dir = os.path.abspath(os.path.expanduser(root_dir))
     lmdb_folder = os.path.abspath(os.path.expanduser(lmdb_folder))
+    h5_root_folder_abs = None
+    if h5_root_folder:
+        h5_root_folder_abs = os.path.abspath(os.path.expanduser(h5_root_folder))
     manifest = load_manifest(lmdb_folder)
 
     with open(json_path, "r", encoding="utf-8") as f:
@@ -262,7 +296,7 @@ def ingest_json_incremental(
     cap = max_ingest if max_ingest is not None and int(max_ingest) > 0 else None
 
     seen_local: set[str] = set()
-    candidates: List[Tuple[str, str, str]] = []  # (basename, path, sid)
+    candidates: List[Tuple[str, str, str, Optional[str]]] = []  # (basename, nifti_path, sid, h5_path)
     dup_in_list = 0
 
     for item in items:
@@ -277,11 +311,17 @@ def ingest_json_incremental(
         if basename_entry(manifest, base) is not None:
             stats.already_present += 1
             continue
-        if not os.path.isfile(p):
+        sid = subject_id_from_path(p, root_dir)
+        h5_path: Optional[str] = None
+        if h5_root_folder_abs is not None:
+            h5_path = _nifti_abs_to_h5_path(p, root_dir, h5_root_folder_abs)
+
+        nifti_ok = os.path.isfile(p)
+        h5_ok = h5_path is not None and os.path.isfile(h5_path)
+        if not nifti_ok and not h5_ok:
             stats.failed += 1
             continue
-        sid = subject_id_from_path(p, root_dir)
-        candidates.append((base, p, sid))
+        candidates.append((base, p, sid, h5_path))
         if cap is not None and len(candidates) >= cap:
             break
 
@@ -351,9 +391,12 @@ def ingest_json_incremental(
     )
     try:
         if workers <= 1:
-            for base, p, sid in candidates:
+            for base, p, sid, h5_path in candidates:
                 try:
-                    iso_b, nat_b, meta_b = process_nifti_to_payloads(p)
+                    if h5_path is not None and os.path.isfile(h5_path):
+                        iso_b, nat_b, meta_b = process_h5_to_payloads(h5_path, source_nifti_path=p)
+                    else:
+                        iso_b, nat_b, meta_b = process_nifti_to_payloads(p)
                 except Exception as e:
                     stats.failed += 1
                     if error_logged < max_error_logs:
@@ -378,7 +421,7 @@ def ingest_json_incremental(
 
             ctx = mp.get_context("spawn")
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-                futs = {ex.submit(_process_worker, p): (base, p, sid) for base, p, sid in candidates}
+                futs = {ex.submit(_process_worker, p, h5_path): (base, p, sid) for base, p, sid, h5_path in candidates}
                 for fut in as_completed(futs):
                     base, p, sid = futs[fut]
                     try:
